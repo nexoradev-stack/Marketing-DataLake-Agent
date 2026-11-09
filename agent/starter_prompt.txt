@@ -1,7 +1,9 @@
-🎯 Build a Prospect Database
-Event Name:
+Please fill out the details below:
+
+Event Name: (required)
+Database Count: (required, maximum 5000)
 Solution:
-Database Count:
+Industry:
 Job Title(s):
 City:
 State:
