@@ -169,6 +169,7 @@ Marketing-DataLake-Agent/
 ├── 📄 docs/                        # troubleshooting, email preview, banner
 ├── 🧪 mcp-server-optional/         # built, blocked by org policy (not in use)
 ├── 🛡️ scripts/check-secrets.sh     # blocks keys and real emails from being committed
+├── 📜 CHANGELOG.md
 └── 🏗️ ARCHITECTURE.md
 ```
 
