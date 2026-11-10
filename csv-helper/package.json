@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "test": "node --test test/helpers.test.js"
+  },
   "dependencies": {
     "@google-cloud/bigquery": "^8.3.1",
     "@google-cloud/functions-framework": "^3.5.1",
