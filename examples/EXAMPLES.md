@@ -1,6 +1,6 @@
 # Examples
 
-Worked examples of how the Marketing Database Agent behaves, end to end.
+Worked examples of how the Marketing DataLake Agent behaves, end to end.
 All names, companies, numbers and emails on this page are **fictional**.
 
 ---
