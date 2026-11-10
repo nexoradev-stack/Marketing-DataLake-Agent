@@ -1,6 +1,7 @@
 # Checks the code on every push and pull request to main.
 #   csv-helper: installs dependencies, checks index.js, runs the unit tests (Node 20 and 22)
 #   scripts:    checks every shell script for syntax errors
+#   secrets:    fails if a key, secret, real project ID or real email address is committed
 
 name: Node.js CI
 
@@ -50,3 +51,11 @@ jobs:
           echo "Checking $f"
           bash -n "$f"
         done
+
+  secrets:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check for keys, secrets and real email addresses
+      run: bash scripts/check-secrets.sh

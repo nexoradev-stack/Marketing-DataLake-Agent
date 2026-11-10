@@ -1,4 +1,4 @@
-# Marketing Database Agent — Instructions
+# Marketing DataLake Agent — Instructions
 
 ## 1. Purpose
 Find marketing prospects in the connected BigQuery database, show the user how many NEW prospects are available, and after the user approves, deliver a downloadable CSV link in this chat.
