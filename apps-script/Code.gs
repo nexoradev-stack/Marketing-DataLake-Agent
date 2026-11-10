@@ -1,5 +1,5 @@
 /**
- * Prospect Database Agent — admin email sender
+ * Marketing DataLake Agent — admin email sender
  *
  * Receives a log entry from the Cloud Run helper and emails the admins
  * a designed HTML notification.
@@ -13,7 +13,7 @@
  */
 
 const SHARED_SECRET = 'PASTE_YOUR_SECRET_HERE';
-const SENDER_NAME = 'Prospect Database Agent';
+const SENDER_NAME = 'Marketing DataLake Agent';
 
 function doPost(e) {
   try {
@@ -115,7 +115,7 @@ function buildHtml_(d) {
     '<td style="width:44px;height:44px;border-radius:22px;background:#E6EEF8;color:' + INK + ';font-size:15px;font-weight:500;text-align:center;vertical-align:middle;">' + esc_(initials) + '</td>' +
     '<td style="padding-left:12px;">' +
     '<div style="font-size:16px;color:' + INK + ';font-weight:500;">' + esc_(d.userName) + '</div>' +
-    '<div style="font-size:12px;color:' + INK + ';font-weight:400;margin-top:2px;">Prospect database download · Marketing Database Agent</div>' +
+    '<div style="font-size:12px;color:' + INK + ';font-weight:400;margin-top:2px;">Prospect database download · Marketing DataLake Agent</div>' +
     '</td>' +
     '</tr></table>' +
     '</td></tr>' +
@@ -208,8 +208,8 @@ function json_(obj) {
 /* ------------------------------------------------------------------ */
 function sendTestEmail() {
   sendLogEmail_('admin-one@example.com,admin-two@example.com', {
-    userName: 'Elaine Smith',
-    userEmail: 'elaine.smith@example.com',
+    userName: 'Sample User',
+    userEmail: 'sample.user@example.com',
     timestamp: '18 Oct 2026, 10:28 AM IST',
     delivered: 5000,
     requested: 5000,

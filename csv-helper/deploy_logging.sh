@@ -24,7 +24,7 @@ ADMIN_EMAILS="admin-one@example.com,admin-two@example.com"
 echo "==> 1/5 Creating log dataset and generation log table (skipped if they exist)"
 if ! bq --location=US show --dataset "${PROJECT_ID}:${DATASET}" >/dev/null 2>&1; then
   bq --location=US mk --dataset \
-    --description "Admin logs for the Marketing Database Agent" \
+    --description "Admin logs for the Marketing DataLake Agent" \
     "${PROJECT_ID}:${DATASET}"
 fi
 if ! bq show "${PROJECT_ID}:${DATASET}.${TABLE}" >/dev/null 2>&1; then
