@@ -1,26 +1,54 @@
 #!/usr/bin/env bash
-# Makes v_prospects_clean automatically include EVERY table in raw_marketing_vendor_database
-# (today 0001-0007, and any table uploaded later).
-#   1. Creates a stored procedure that rebuilds the view from all tables in the dataset
-#   2. Runs it once now
-#   3. Schedules it to run every hour, so new uploads are picked up automatically
+# Sets up the prospect views, the unmailable block list and the hourly refresh.
+#
+# Result:
+#   raw_marketing_vendor_database   <- your source tables (Marketing_Database_0001, 0002, ... any future ones)
+#     v_prospects_clean             <- what the agent reads = all prospects MINUS unmailable
+#     refresh_prospect_view()       <- procedure, run every hour
+#   Unmailable_Records
+#     unmailable_records            <- block list (filled by the Salesforce sync)
+#     v_prospects_all               <- every source table, cleaned and de-duplicated (rebuilt hourly)
+#     v_unmailable_matches          <- report: prospects that are blocked, and why
+#
+# Safe to re-run. Does NOT delete data in unmailable_records.
 # Run from Cloud Shell:
 #   bash setup_auto_view.sh
 set -euo pipefail
 
 P="your-gcp-project-id"
 D="raw_marketing_vendor_database"
+U="Unmailable_Records"
 PROJECT_NUMBER="YOUR_PROJECT_NUMBER"
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
-echo "==> 1/4 Creating the refresh procedure"
+echo "==> 1/6 Creating the ${U} dataset and the block list table (skipped if they exist)"
+if ! bq --location=US show --dataset "${P}:${U}" >/dev/null 2>&1; then
+  bq --location=US mk --dataset \
+    --description "Salesforce unmailable contacts and the views built on them" \
+    "${P}:${U}"
+fi
+bq query --project_id="${P}" --location=US --use_legacy_sql=false <<SQL
+CREATE TABLE IF NOT EXISTS \`${P}.${U}.unmailable_records\` (
+  email          STRING NOT NULL,   -- lowercased, trimmed
+  opted_out      BOOL,
+  do_not_email   BOOL,
+  hard_bounce    BOOL,
+  soft_bounce    BOOL,
+  crm_contact_id STRING,
+  source         STRING,            -- e.g. 'account_engagement_api'
+  loaded_at      TIMESTAMP
+)
+OPTIONS (description = 'Contacts that must never be exported: opted out, do not email, hard bounce or soft bounce.');
+SQL
+
+echo "==> 2/6 Creating the refresh procedure"
 bq query --project_id="${P}" --location=US --use_legacy_sql=false <<SQL
 CREATE OR REPLACE PROCEDURE \`${P}.${D}.refresh_prospect_view\`()
 BEGIN
   DECLARE union_sql STRING;
   DECLARE table_count INT64;
 
-  -- Every base table in the dataset that has an Email and a Company column.
+  -- Every base table in the source dataset that has an Email and a Company column.
   -- Missing optional columns are filled with NULL, so new tables never break the view.
   SET (union_sql, table_count) = (
     WITH cols AS (
@@ -65,8 +93,9 @@ BEGIN
     RAISE USING MESSAGE = 'No prospect tables (with Email and Company columns) found in the dataset.';
   END IF;
 
+  -- Rebuilds ONLY v_prospects_all. v_prospects_clean (with the unmailable filter) is never touched.
   EXECUTE IMMEDIATE CONCAT(
-    'CREATE OR REPLACE VIEW \`${P}.${D}.v_prospects_clean\` AS WITH src AS (', union_sql, ')',
+    'CREATE OR REPLACE VIEW \`${P}.${U}.v_prospects_all\` AS WITH src AS (', union_sql, ')',
     r"""
 ,
 base AS (
@@ -102,11 +131,39 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY Email_ID ORDER BY Company_Name, Source_T
 END;
 SQL
 
-echo "==> 2/4 Running it now"
+echo "==> 3/6 Running it now (builds ${U}.v_prospects_all)"
 bq query --project_id="${P}" --location=US --use_legacy_sql=false --format=pretty \
   "CALL \`${P}.${D}.refresh_prospect_view\`()"
 
-echo "==> 3/4 Allowing scheduled queries to run as the project service account"
+echo "==> 4/6 Creating the agent view and the blocked-prospects report"
+bq query --project_id="${P}" --location=US --use_legacy_sql=false <<SQL
+-- What the agent reads: all prospects MINUS unmailable. Same name and columns as before.
+CREATE OR REPLACE VIEW \`${P}.${D}.v_prospects_clean\` AS
+SELECT p.*
+FROM \`${P}.${U}.v_prospects_all\` p
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM \`${P}.${U}.unmailable_records\` u
+  WHERE u.email = p.Email_ID
+);
+
+-- Report for admins: prospects in BigQuery that are blocked, and why.
+CREATE OR REPLACE VIEW \`${P}.${U}.v_unmailable_matches\` AS
+SELECT
+  p.*,
+  u.opted_out,
+  u.do_not_email,
+  u.hard_bounce,
+  u.soft_bounce,
+  u.crm_contact_id,
+  u.source    AS flagged_source,
+  u.loaded_at AS flagged_at
+FROM \`${P}.${U}.v_prospects_all\` p
+JOIN \`${P}.${U}.unmailable_records\` u
+  ON u.email = p.Email_ID;
+SQL
+
+echo "==> 5/6 Allowing scheduled queries to run as the project service account"
 gcloud services enable bigquerydatatransfer.googleapis.com
 DTS_SA="service-${PROJECT_NUMBER}@gcp-sa-bigquerydatatransfer.iam.gserviceaccount.com"
 gcloud beta services identity create --service=bigquerydatatransfer.googleapis.com --project="${P}" >/dev/null 2>&1 || true
@@ -119,7 +176,7 @@ for i in $(seq 1 12); do
   echo "    service account not ready yet (attempt $i/12), waiting 30 seconds..."; sleep 30
 done
 
-echo "==> 4/4 Scheduling the refresh every hour"
+echo "==> 6/6 Scheduling the refresh every hour"
 if bq ls --transfer_config --transfer_location=us --project_id="${P}" 2>/dev/null | grep -q "Refresh prospect view"; then
   echo "    schedule already exists, skipping"
 else
@@ -134,4 +191,14 @@ else
 fi
 
 echo ""
-echo "DONE: the view now includes every prospect table in ${D} and refreshes every hour."
+echo "==> Check (block_is_active should be true; the first two counts match while the block list is empty)"
+bq query --project_id="${P}" --location=US --use_legacy_sql=false --format=pretty "
+SELECT
+  (SELECT CONTAINS_SUBSTR(view_definition, 'unmailable_records')
+     FROM \`${P}.${D}\`.INFORMATION_SCHEMA.VIEWS WHERE table_name = 'v_prospects_clean') AS block_is_active,
+  (SELECT COUNT(*) FROM \`${P}.${U}.v_prospects_all\`)       AS all_prospects,
+  (SELECT COUNT(*) FROM \`${P}.${D}.v_prospects_clean\`)     AS agent_can_export,
+  (SELECT COUNT(*) FROM \`${P}.${U}.unmailable_records\`)    AS unmailable_loaded"
+
+echo ""
+echo "DONE: every table in ${D} is included (refreshed hourly) and unmailable contacts are always excluded."

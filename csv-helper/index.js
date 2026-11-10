@@ -1,9 +1,11 @@
-// Prospect CSV helper (rename + log + email)
+// Prospect CSV helper (rename + delivery log + generation log + email)
 // Runs automatically whenever a new CSV lands in the export bucket under exports/.
 //   1. Sets the download name:  Database - <Event Name>.csv
 //   2. Finds the BigQuery export job that wrote the file (who ran it, when, what)
-//   3. Counts the real rows in the file
-//   4. Adds one row to the permanent log table in BigQuery
+//   3. Saves every delivered prospect email to delivered_records
+//      (user + event + email), so the same user never gets the same person
+//      twice for the same event (Rule 2)
+//   4. Adds one row to the permanent generation log in BigQuery
 //   5. Emails the admins through the Apps Script mail sender
 
 const functions = require('@google-cloud/functions-framework');
@@ -17,12 +19,15 @@ const PROJECT_ID = process.env.PROJECT_ID || 'your-gcp-project-id';
 const BQ_LOCATION = process.env.BQ_LOCATION || 'US';
 const JOBS_VIEW = process.env.JOBS_VIEW || '`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT';
 const LOG_TABLE = process.env.LOG_TABLE || `${PROJECT_ID}.prospect_agent_logs.generation_log`;
+const DELIVERED_TABLE = process.env.DELIVERED_TABLE ||
+  `${PROJECT_ID}.prospect_agent_logs.delivered_records`;
 const MAIL_WEBHOOK_URL = process.env.MAIL_WEBHOOK_URL || '';
 const MAIL_SECRET = process.env.MAIL_SECRET || '';
 const ADMIN_EMAILS = process.env.ADMIN_EMAILS ||
   'admin-one@example.com,admin-two@example.com';
 const TIMEZONE = 'Asia/Kolkata';
 const LINK_MS = 7 * 24 * 60 * 60 * 1000 - 60 * 1000; // just under the 7-day maximum
+const EMAIL_HEADER = 'email id';
 
 const storage = new Storage();
 const bigquery = new BigQuery({ projectId: PROJECT_ID });
@@ -71,25 +76,69 @@ function formatIST(date) {
   return `${text.replace(/\b(am|pm)\b/i, (m) => m.toUpperCase())} IST`;
 }
 
-// Counts CSV data rows, respecting quoted values that contain line breaks.
-function countCsvRows(text) {
-  let rows = 0;
+// Rule 1: same event if only capitals, spaces, dashes or symbols differ.
+// Must match the agent SQL: REGEXP_REPLACE(LOWER(name), r'[^a-z0-9]', '')
+function eventKey(eventName) {
+  return (eventName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Parses CSV text into rows of fields, respecting quotes and line breaks in values.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
   let inQuotes = false;
-  let lineHasContent = false;
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-      lineHasContent = true;
-    } else if (ch === '\n' && !inQuotes) {
-      if (lineHasContent) rows += 1;
-      lineHasContent = false;
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
     } else if (ch !== '\r') {
-      lineHasContent = true;
+      field += ch;
     }
   }
-  if (lineHasContent) rows += 1;
-  return Math.max(0, rows - 1); // minus header
+  if (field !== '' || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((value) => value.trim() !== ''));
+}
+
+// Data rows (without header) in a CSV.
+function countCsvRows(text) {
+  return Math.max(0, parseCsv(text).length - 1);
+}
+
+// Unique, lowercased prospect emails from the "Email ID" column.
+function extractEmails(text) {
+  const rows = parseCsv(text);
+  if (!rows.length) return [];
+  const idx = rows[0].findIndex((h) => h.trim().toLowerCase() === EMAIL_HEADER);
+  if (idx < 0) return [];
+  const emails = new Set();
+  rows.slice(1).forEach((r) => {
+    const email = (r[idx] || '').trim().toLowerCase();
+    if (email) emails.add(email);
+  });
+  return [...emails];
 }
 
 // Reads "-- META | key=value | key=value" from the export SQL.
@@ -115,7 +164,7 @@ function parseMeta(query) {
 }
 
 // ---------------------------------------------------------------------------
-// BigQuery lookups
+// BigQuery lookups and writes
 // ---------------------------------------------------------------------------
 async function findExportJob(bucket, objectName) {
   const folder = `${bucket}/${objectName.split('/').slice(0, -1).join('/')}/`;
@@ -134,6 +183,34 @@ async function findExportJob(bucket, objectName) {
     await sleep(5000);
   }
   return null;
+}
+
+// One row per delivered prospect. Skipped if this file was already recorded
+// (safe if the function is retried).
+async function insertDelivered(entry) {
+  if (!entry.emails.length) return 0;
+  const query = `
+    INSERT INTO \`${DELIVERED_TABLE}\`
+      (delivered_at, user_email, event_name, event_key, email, gcs_uri, bq_job_id)
+    SELECT TIMESTAMP(@delivered_at), @user_email, @event_name, @event_key, email, @gcs_uri, @bq_job_id
+    FROM UNNEST(@emails) AS email
+    WHERE NOT EXISTS (SELECT 1 FROM \`${DELIVERED_TABLE}\` WHERE gcs_uri = @gcs_uri)`;
+
+  await bigquery.query({
+    query,
+    location: BQ_LOCATION,
+    params: entry,
+    types: {
+      delivered_at: 'STRING',
+      user_email: 'STRING',
+      event_name: 'STRING',
+      event_key: 'STRING',
+      emails: ['STRING'],
+      gcs_uri: 'STRING',
+      bq_job_id: 'STRING'
+    }
+  });
+  return entry.emails.length;
 }
 
 async function insertLog(entry) {
@@ -216,6 +293,7 @@ functions.cloudEvent('setDownloadName', async (cloudEvent) => {
 
   const file = storage.bucket(bucket).file(name);
   const downloadName = friendlyName(name);
+  const gcsUri = `gs://${bucket}/${name}`;
 
   // 1. Download name (always)
   await file.setMetadata({
@@ -223,28 +301,54 @@ functions.cloudEvent('setDownloadName', async (cloudEvent) => {
     contentType: 'text/csv; charset=utf-8',
     cacheControl: 'no-store'
   });
-  console.log(`Set download name for gs://${bucket}/${name} -> ${downloadName}`);
+  console.log(`Set download name for ${gcsUri} -> ${downloadName}`);
 
-  // Log and email only once per export (first file of the export)
+  // 2. Who ran it, and the file contents
+  let job;
+  let meta;
+  let text;
+  let userEmail;
+  let generatedAt;
+  let eventName;
+  try {
+    job = await findExportJob(bucket, name);
+    meta = parseMeta(job?.query);
+    userEmail = job?.user_email || 'unknown';
+    generatedAt = job?.creation_time?.value
+      ? new Date(job.creation_time.value)
+      : new Date(data.timeCreated || Date.now());
+    eventName = meta.event || downloadName.replace(/^Database - /, '').replace(/\.csv$/, '');
+    const [buffer] = await file.download();
+    text = buffer.toString('utf8');
+  } catch (error) {
+    console.error('Could not read export job or file (rename already done):', error);
+    return;
+  }
+
+  // 3. Delivery log (every file of the export, so large exports are fully recorded)
+  try {
+    const saved = await insertDelivered({
+      delivered_at: generatedAt.toISOString(),
+      user_email: userEmail,
+      event_name: eventName,
+      event_key: eventKey(eventName),
+      emails: extractEmails(text),
+      gcs_uri: gcsUri,
+      bq_job_id: job?.job_id || ''
+    });
+    console.log(`Delivery log: ${saved} emails for ${userEmail} / ${eventName}`);
+  } catch (error) {
+    console.error('Delivery log failed:', error);
+  }
+
+  // Generation log and email only once per export (first file of the export)
   if (!isFirstShard(name)) return;
 
   try {
-    // 2. Who ran it
-    const job = await findExportJob(bucket, name);
-    const meta = parseMeta(job?.query);
-    const userEmail = job?.user_email || 'unknown';
-    const generatedAt = job?.creation_time?.value
-      ? new Date(job.creation_time.value)
-      : new Date(data.timeCreated || Date.now());
-
-    // 3. Real row count
-    const [buffer] = await file.download();
-    const delivered = countCsvRows(buffer.toString('utf8'));
-
-    const eventName = meta.event || downloadName.replace(/^Database - /, '').replace(/\.csv$/, '');
+    const delivered = countCsvRows(text);
     const requested = Number.parseInt(meta.requested, 10);
 
-    // 4. Permanent log
+    // 4. Permanent generation log
     await insertLog({
       generated_at: generatedAt.toISOString(),
       user_email: userEmail,
@@ -256,7 +360,7 @@ functions.cloudEvent('setDownloadName', async (cloudEvent) => {
       requested_count: Number.isFinite(requested) ? requested : delivered,
       delivered_count: delivered,
       file_name: downloadName,
-      gcs_uri: `gs://${bucket}/${name}`,
+      gcs_uri: gcsUri,
       bq_job_id: job?.job_id || ''
     });
 
@@ -287,8 +391,18 @@ functions.cloudEvent('setDownloadName', async (cloudEvent) => {
 
     console.log(`Logged and emailed: ${userEmail}, ${delivered} rows, ${eventName}`);
   } catch (error) {
-    console.error('Logging or email failed (file rename already done):', error);
+    console.error('Generation log or email failed (rename and delivery log already done):', error);
   }
 });
 
-module.exports = { friendlyName, parseMeta, countCsvRows, nameFromEmail, formatIST, isFirstShard };
+module.exports = {
+  friendlyName,
+  parseMeta,
+  parseCsv,
+  countCsvRows,
+  extractEmails,
+  eventKey,
+  nameFromEmail,
+  formatIST,
+  isFirstShard
+};

@@ -1,7 +1,7 @@
 {
   "name": "prospect-csv-rename",
-  "version": "2.0.0",
-  "description": "Renames exported prospect CSVs, logs each generation to BigQuery and emails the admins",
+  "version": "3.0.0",
+  "description": "Renames exported prospect CSVs, logs delivered prospects and each generation to BigQuery, and emails the admins",
   "main": "index.js",
   "engines": {
     "node": ">=20"
